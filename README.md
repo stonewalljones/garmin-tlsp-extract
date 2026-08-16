@@ -64,19 +64,29 @@ python garmin_extractor.py -i travelapse_video.mp4 -o my_route.gpx
 python garmin_extractor.py -i travelapse_video.mp4 --workers 8 --format all
 ```
 
-### 2. Export All Formats (.gpx, .csv, .geojson, .kml)
+### 3. Debug Mode (Investigate Raw OCR & Clean Decisions)
+To see raw OCR text for every frame and investigate why certain frames were dropped or kept:
+```bash
+python garmin_extractor.py -i travelapse_video.mp4 --debug
+```
+This generates `<video_stem>_debug_raw.csv` and prints a summary breakdown:
+- **`status`**: `KEPT`, `DROPPED_INCOMPLETE`, `NO_TEXT_DETECTED`, `DROPPED_OUTLIER_SPIKE`, `DROPPED_DUPLICATE`
+- **`drop_reason`**: Detailed explanation (e.g. *Missing required fields: speed*, *Jump of 340.2m in 0.03s implies 11340 m/s velocity*, etc.)
+- **`raw_ocr_text`**: The unedited OCR text string extracted from each frame.
+
+### 4. Export All Formats (.gpx, .csv, .geojson, .kml)
 ```bash
 python garmin_extractor.py -i travelapse_video.mp4 --format all
 ```
 
-### 3. Optional: Downsample Frame Rate
+### 5. Optional: Downsample Frame Rate
 If you have a very long video and want to sample at specific intervals (e.g. 1 frame every 2 seconds to speed up processing):
 ```bash
 # Sample 1 frame every 2.0 seconds:
 python garmin_extractor.py -i travelapse_video.mp4 --format all --interval 2.0
 ```
 
-### 4. Preview ROI & Tune Bounding Box
+### 6. Preview ROI & Tune Bounding Box
 Before running a long video, verify that the telemetry banner is cleanly captured in the ROI:
 ```bash
 python garmin_extractor.py -i travelapse_video.mp4 --preview

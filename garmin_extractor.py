@@ -109,6 +109,25 @@ class TelemetryPoint:
         }
 
 
+@dataclass
+class DebugFrameRecord:
+    """Detailed diagnostic record for every frame processed before/after cleaning."""
+
+    frame_number: int
+    video_time_sec: float
+    raw_ocr: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    timestamp_iso: Optional[str] = None
+    speed_mph: Optional[float] = None
+    speed_kmh: Optional[float] = None
+    has_coords: bool = False
+    has_timestamp: bool = False
+    has_speed: bool = False
+    status: str = "PENDING"
+    drop_reason: str = ""
+
+
 # ==============================================================================
 # Telemetry Text Parsing (GPS, Timestamp, Speed)
 # ==============================================================================
@@ -336,6 +355,74 @@ class TelemetryParser:
             video_time_sec=time_sec,
             raw_text=text,
         )
+
+    @classmethod
+    def parse_frame_debug(
+        cls, text: str, frame_num: int = 0, time_sec: float = 0.0
+    ) -> Tuple[Optional[TelemetryPoint], DebugFrameRecord]:
+        """Parses a frame OCR text, creating both a candidate TelemetryPoint and diagnostic DebugFrameRecord."""
+        coords = cls.parse_coordinates(text)
+        mph, kmh, mps = cls.parse_speed(text)
+        dt = cls.parse_timestamp(text)
+
+        has_coords = coords is not None
+        has_dt = dt is not None
+        has_speed = mph is not None or kmh is not None
+
+        lat = coords[0] if coords else None
+        lon = coords[1] if coords else None
+        dt_iso = dt.isoformat() if dt else None
+
+        missing = []
+        if not has_coords:
+            missing.append("coordinates")
+        if not has_dt:
+            missing.append("timestamp")
+        if not has_speed:
+            missing.append("speed")
+
+        clean_text = text.replace("\n", " ").strip()
+        if not clean_text:
+            status = "NO_TEXT_DETECTED"
+            reason = "OCR returned empty string (no text detected in ROI)"
+        elif missing:
+            status = "DROPPED_INCOMPLETE"
+            reason = f"Missing required fields: {', '.join(missing)}"
+        else:
+            status = "CANDIDATE"
+            reason = "Successfully parsed coordinates, timestamp, and speed"
+
+        rec = DebugFrameRecord(
+            frame_number=frame_num,
+            video_time_sec=time_sec,
+            raw_ocr=clean_text,
+            latitude=lat,
+            longitude=lon,
+            timestamp_iso=dt_iso,
+            speed_mph=mph,
+            speed_kmh=kmh,
+            has_coords=has_coords,
+            has_timestamp=has_dt,
+            has_speed=has_speed,
+            status=status,
+            drop_reason=reason,
+        )
+
+        pt = None
+        if has_coords:
+            pt = TelemetryPoint(
+                latitude=lat,
+                longitude=lon,
+                timestamp=dt,
+                speed_mph=mph,
+                speed_kmh=kmh,
+                speed_mps=mps,
+                frame_number=frame_num,
+                video_time_sec=time_sec,
+                raw_text=text,
+            )
+
+        return (pt, rec)
 
 
 # ==============================================================================
@@ -616,31 +703,45 @@ class VideoProcessor:
         pipe.terminate()
 
 
-def _process_frame_worker(task: Tuple[int, float, Any]) -> Optional[TelemetryPoint]:
+def _process_frame_worker(task: Tuple[int, float, Any]) -> Tuple[Optional[TelemetryPoint], DebugFrameRecord]:
     """Worker function executed in parallel threads to preprocess, OCR, and parse one frame."""
     frame_num, sec, roi = task
     if roi is None:
-        return None
+        rec = DebugFrameRecord(
+            frame_number=frame_num,
+            video_time_sec=sec,
+            raw_ocr="",
+            status="NO_IMAGE",
+            drop_reason="Failed to extract frame ROI from video stream",
+        )
+        return (None, rec)
     try:
         candidates = VideoProcessor.preprocess_for_ocr(roi)
         ocr_text = VideoProcessor.run_ocr(candidates)
-        if not ocr_text:
-            return None
-        return TelemetryParser.parse_frame_text(ocr_text, frame_num, sec)
-    except Exception:
-        return None
+        return TelemetryParser.parse_frame_debug(ocr_text, frame_num, sec)
+    except Exception as e:
+        rec = DebugFrameRecord(
+            frame_number=frame_num,
+            video_time_sec=sec,
+            raw_ocr="",
+            status="ERROR",
+            drop_reason=f"Exception during OCR processing: {e}",
+        )
+        return (None, rec)
 
 
 def process_frames_parallel(
     frame_gen: Generator[Tuple[int, float, Any], None, None],
     num_workers: int = 4,
     total_frames: Optional[int] = None,
-) -> List[TelemetryPoint]:
+) -> Tuple[List[TelemetryPoint], List[DebugFrameRecord]]:
     """
     Executes frame preprocessing and OCR across multiple worker threads in parallel.
     Uses a rolling buffer to minimize memory usage while keeping CPU workers fully saturated.
+    Returns both candidate TelemetryPoints and comprehensive DebugFrameRecords.
     """
     points: List[TelemetryPoint] = []
+    debug_records: List[DebugFrameRecord] = []
     max_queued = max(8, num_workers * 4)
 
     import concurrent.futures
@@ -663,18 +764,20 @@ def process_frames_parallel(
                     future_map.keys(), return_when=concurrent.futures.FIRST_COMPLETED
                 )
                 for f in done:
-                    pt = f.result()
+                    pt, rec = f.result()
                     if pt:
                         points.append(pt)
+                    debug_records.append(rec)
                     if pbar is not None:
                         pbar.update(1)
                     del future_map[f]
 
         # Drain all remaining tasks
         for f in concurrent.futures.as_completed(future_map.keys()):
-            pt = f.result()
+            pt, rec = f.result()
             if pt:
                 points.append(pt)
+            debug_records.append(rec)
             if pbar is not None:
                 pbar.update(1)
 
@@ -683,7 +786,8 @@ def process_frames_parallel(
 
     # Ensure chronological sort by frame number
     points.sort(key=lambda p: p.frame_number)
-    return points
+    debug_records.sort(key=lambda r: r.frame_number)
+    return points, debug_records
 
 
 # ==============================================================================
@@ -723,6 +827,47 @@ class TelemetryExporter:
                         p.frame_number,
                         f"{p.video_time_sec:.3f}",
                         p.raw_text.replace("\n", " ").strip(),
+                    ]
+                )
+
+    @staticmethod
+    def to_debug_csv(records: List[DebugFrameRecord], output_path: str) -> None:
+        """Exports raw frame OCR and parsing/cleaning diagnostics to a CSV for troubleshooting."""
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "frame_number",
+                    "video_time_sec",
+                    "status",
+                    "drop_reason",
+                    "has_coords",
+                    "has_timestamp",
+                    "has_speed",
+                    "latitude",
+                    "longitude",
+                    "timestamp_iso",
+                    "speed_mph",
+                    "speed_kmh",
+                    "raw_ocr_text",
+                ]
+            )
+            for r in records:
+                writer.writerow(
+                    [
+                        r.frame_number,
+                        f"{r.video_time_sec:.3f}",
+                        r.status,
+                        r.drop_reason,
+                        "YES" if r.has_coords else "NO",
+                        "YES" if r.has_timestamp else "NO",
+                        "YES" if r.has_speed else "NO",
+                        f"{r.latitude:.6f}" if r.latitude is not None else "",
+                        f"{r.longitude:.6f}" if r.longitude is not None else "",
+                        r.timestamp_iso or "",
+                        f"{r.speed_mph:.2f}" if r.speed_mph is not None else "",
+                        f"{r.speed_kmh:.2f}" if r.speed_kmh is not None else "",
+                        r.raw_ocr.replace("\n", " ").strip(),
                     ]
                 )
 
@@ -916,6 +1061,7 @@ def clean_telemetry_points(
     require_complete: bool = True,
     max_speed_kmh: float = 250.0,
     max_allowed_speed_mps: float = 70.0,
+    debug_map: Optional[Dict[int, DebugFrameRecord]] = None,
 ) -> List[TelemetryPoint]:
     """
     Cleans and validates telemetry data:
@@ -934,18 +1080,33 @@ def clean_telemetry_points(
         # Require all 3 fields: coordinates, timestamp, and speed
         if require_complete:
             if p.timestamp is None:
+                if debug_map and p.frame_number in debug_map:
+                    debug_map[p.frame_number].status = "DROPPED_INCOMPLETE"
+                    debug_map[p.frame_number].drop_reason = "Missing valid parsed timestamp"
                 continue
             if p.speed_mph is None and p.speed_kmh is None:
+                if debug_map and p.frame_number in debug_map:
+                    debug_map[p.frame_number].status = "DROPPED_INCOMPLETE"
+                    debug_map[p.frame_number].drop_reason = "Missing valid parsed speed"
                 continue
 
         # Coordinate bounds check
         if not (-90.0 <= p.latitude <= 90.0 and -180.0 <= p.longitude <= 180.0):
+            if debug_map and p.frame_number in debug_map:
+                debug_map[p.frame_number].status = "DROPPED_INVALID_COORDS"
+                debug_map[p.frame_number].drop_reason = f"Coordinates out of bounds: ({p.latitude:.6f}, {p.longitude:.6f})"
             continue
         if abs(p.latitude) < 0.0001 and abs(p.longitude) < 0.0001:
-            continue  # Null island check
+            if debug_map and p.frame_number in debug_map:
+                debug_map[p.frame_number].status = "DROPPED_INVALID_COORDS"
+                debug_map[p.frame_number].drop_reason = "Null Island coordinates (0.0, 0.0)"
+            continue
 
         # Speed bounds check
         if p.speed_kmh is not None and (p.speed_kmh < 0.0 or p.speed_kmh > max_speed_kmh):
+            if debug_map and p.frame_number in debug_map:
+                debug_map[p.frame_number].status = "DROPPED_SPEED_ANOMALY"
+                debug_map[p.frame_number].drop_reason = f"Speed ({p.speed_kmh:.1f} km/h) exceeds maximum threshold ({max_speed_kmh:.1f} km/h)"
             continue
 
         valid_points.append(p)
@@ -961,10 +1122,17 @@ def clean_telemetry_points(
                 and last.timestamp == p.timestamp
                 and last.speed_mph == p.speed_mph
             ):
+                if debug_map and p.frame_number in debug_map:
+                    debug_map[p.frame_number].status = "DROPPED_DUPLICATE"
+                    debug_map[p.frame_number].drop_reason = f"Identical coordinates and timestamp as previous frame #{last.frame_number}"
                 continue
         deduped.append(p)
 
     if len(deduped) <= 2:
+        for p in deduped:
+            if debug_map and p.frame_number in debug_map:
+                debug_map[p.frame_number].status = "KEPT"
+                debug_map[p.frame_number].drop_reason = "Valid verified GPS waypoint"
         return deduped
 
     # Step 3: Neighbor-based GPS Sanity Check (Multi-point spike / glitch rejection)
@@ -973,9 +1141,9 @@ def clean_telemetry_points(
         if n <= 2:
             return pts
 
-        outliers = set()
+        outliers: Dict[int, str] = {}
 
-        def is_spike(prev_pt: TelemetryPoint, curr_pt: TelemetryPoint, next_pt: TelemetryPoint) -> bool:
+        def is_spike(prev_pt: TelemetryPoint, curr_pt: TelemetryPoint, next_pt: TelemetryPoint) -> Tuple[bool, str]:
             d_prev_curr = haversine_distance_meters(prev_pt.latitude, prev_pt.longitude, curr_pt.latitude, curr_pt.longitude)
             d_curr_next = haversine_distance_meters(curr_pt.latitude, curr_pt.longitude, next_pt.latitude, next_pt.longitude)
             d_prev_next = haversine_distance_meters(prev_pt.latitude, prev_pt.longitude, next_pt.latitude, next_pt.longitude)
@@ -991,17 +1159,17 @@ def clean_telemetry_points(
                 dt_total = dt_prev + dt_next
                 v_direct = d_prev_next / dt_total
                 if v_direct <= max_allowed_speed_mps:
-                    return True
-                # Also if the jump exceeds 50m when reported speed is near zero/slow
+                    return (True, f"Jump of {d_prev_curr:.1f}m in {dt_prev:.2f}s implies {v_prev:.1f} m/s (deviates from #{prev_pt.frame_number} & #{next_pt.frame_number})")
                 expected_dist = max(50.0, (curr_pt.speed_mps or 25.0) * 3.0 * dt_prev)
                 if d_prev_curr > expected_dist and d_curr_next > expected_dist and d_prev_next < expected_dist:
-                    return True
-            return False
+                    return (True, f"Jump of {d_prev_curr:.1f}m deviates from path ({d_prev_next:.1f}m between #{prev_pt.frame_number} and #{next_pt.frame_number})")
+            return (False, "")
 
         # Internal points
         for i in range(1, n - 1):
-            if is_spike(pts[i - 1], pts[i], pts[i + 1]):
-                outliers.add(i)
+            spike, reason = is_spike(pts[i - 1], pts[i], pts[i + 1])
+            if spike:
+                outliers[i] = reason
 
         # Check endpoints
         if n >= 3 and 0 not in outliers and 1 not in outliers and 2 not in outliers:
@@ -1010,7 +1178,7 @@ def clean_telemetry_points(
             dt01 = max(0.05, abs((pts[1].timestamp - pts[0].timestamp).total_seconds()) if (pts[1].timestamp and pts[0].timestamp) else 1.0)
             dt12 = max(0.05, abs((pts[2].timestamp - pts[1].timestamp).total_seconds()) if (pts[2].timestamp and pts[1].timestamp) else 1.0)
             if (d01 / dt01 > max_allowed_speed_mps) and (d12 / dt12 <= max_allowed_speed_mps):
-                outliers.add(0)
+                outliers[0] = f"Endpoint jump {d01:.1f}m in {dt01:.2f}s implies {d01/dt01:.1f} m/s"
 
         if n >= 3 and (n - 1) not in outliers and (n - 2) not in outliers and (n - 3) not in outliers:
             d_last = haversine_distance_meters(pts[n - 2].latitude, pts[n - 2].longitude, pts[n - 1].latitude, pts[n - 1].longitude)
@@ -1018,7 +1186,13 @@ def clean_telemetry_points(
             dt_last = max(0.05, abs((pts[n - 1].timestamp - pts[n - 2].timestamp).total_seconds()) if (pts[n - 1].timestamp and pts[n - 2].timestamp) else 1.0)
             dt_prev = max(0.05, abs((pts[n - 2].timestamp - pts[n - 3].timestamp).total_seconds()) if (pts[n - 2].timestamp and pts[n - 3].timestamp) else 1.0)
             if (d_last / dt_last > max_allowed_speed_mps) and (d_prev / dt_prev <= max_allowed_speed_mps):
-                outliers.add(n - 1)
+                outliers[n - 1] = f"Endpoint jump {d_last:.1f}m in {dt_last:.2f}s implies {d_last/dt_last:.1f} m/s"
+
+        for idx, reason in outliers.items():
+            fnum = pts[idx].frame_number
+            if debug_map and fnum in debug_map:
+                debug_map[fnum].status = "DROPPED_OUTLIER_SPIKE"
+                debug_map[fnum].drop_reason = reason
 
         return [pts[i] for i in range(n) if i not in outliers]
 
@@ -1028,6 +1202,12 @@ def clean_telemetry_points(
         sanitized = filter_spikes_single_pass(sanitized)
         if len(sanitized) == prev_len:
             break
+
+    # Mark remaining points as KEPT
+    for p in sanitized:
+        if debug_map and p.frame_number in debug_map:
+            debug_map[p.frame_number].status = "KEPT"
+            debug_map[p.frame_number].drop_reason = "Valid verified GPS waypoint"
 
     return sanitized
 
@@ -1204,6 +1384,16 @@ Examples:
         help="Generate preview_roi.png of the first sampled frame and print OCR output without processing whole video.",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Export comprehensive debug CSV (<video_stem>_debug_raw.csv) with raw OCR text and per-frame keep/drop reasons.",
+    )
+    parser.add_argument(
+        "--debug-output",
+        default=None,
+        help="Custom path for raw debug CSV output file (default: <video_dir>/<video_stem>_debug_raw.csv).",
+    )
+    parser.add_argument(
         "--check-embedded",
         action="store_true",
         default=True,
@@ -1218,6 +1408,7 @@ Examples:
         sys.exit(1)
 
     roi_bbox = tuple(args.roi)
+    debug_records: List[DebugFrameRecord] = []
 
     # Check if input is a single image file
     is_single_image = video_path.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
@@ -1237,8 +1428,9 @@ Examples:
         candidates = processor.preprocess_for_ocr(roi)
         ocr_text = processor.run_ocr(candidates)
         print(f"[*] Raw OCR Output:\n---\n{ocr_text.strip()}\n---")
-        p = TelemetryParser.parse_frame_text(ocr_text, frame_num=1, time_sec=0.0)
-        points = [p] if p else []
+        pt, rec = TelemetryParser.parse_frame_debug(ocr_text, frame_num=1, time_sec=0.0)
+        points = [pt] if pt else []
+        debug_records = [rec]
     else:
         if args.preview:
             preview_roi(str(video_path), roi_bbox)
@@ -1282,21 +1474,48 @@ Examples:
                 else processor.extract_frames_ffmpeg(sample_interval_sec=args.interval, every_frame=args.every_frame)
             )
 
-            points = process_frames_parallel(frame_gen, num_workers=args.workers, total_frames=total_frames)
+            points, debug_records = process_frames_parallel(frame_gen, num_workers=args.workers, total_frames=total_frames)
 
+    debug_map = {r.frame_number: r for r in debug_records}
     print(f"[*] Raw extracted points: {len(points)}")
-    points = clean_telemetry_points(points)
+    points = clean_telemetry_points(points, debug_map=debug_map)
     print(f"[+] Validated points after cleaning: {len(points)}")
+
+    base_stem = video_path.stem
+    out_dir = video_path.parent
+
+    # Export debug CSV if requested
+    if args.debug:
+        debug_out_file = Path(args.debug_output) if args.debug_output else out_dir / f"{base_stem}_debug_raw.csv"
+        TelemetryExporter.to_debug_csv(debug_records, str(debug_out_file))
+        print(f"[✓] Saved DEBUG raw OCR report: {debug_out_file}")
+
+        # Print breakdown summary
+        from collections import Counter
+        status_counts = Counter(r.status for r in debug_records)
+        print("\n" + "=" * 60)
+        print("  DEBUG TELEMETRY CLEANING SUMMARY")
+        print("=" * 60)
+        print(f"  Total Frames Analyzed:      {len(debug_records)}")
+        print(f"  ✓ Valid Kept Waypoints:     {status_counts.get('KEPT', 0)}")
+        print(f"  • Dropped (Incomplete):     {status_counts.get('DROPPED_INCOMPLETE', 0)}")
+        print(f"  • Dropped (No OCR text):    {status_counts.get('NO_TEXT_DETECTED', 0)}")
+        print(f"  • Dropped (GPS Spike Jump): {status_counts.get('DROPPED_OUTLIER_SPIKE', 0)}")
+        print(f"  • Dropped (Duplicate Pos):  {status_counts.get('DROPPED_DUPLICATE', 0)}")
+        if status_counts.get("DROPPED_INVALID_COORDS", 0) > 0:
+            print(f"  • Dropped (Invalid Coords): {status_counts.get('DROPPED_INVALID_COORDS', 0)}")
+        if status_counts.get("DROPPED_SPEED_ANOMALY", 0) > 0:
+            print(f"  • Dropped (Speed Anomaly):  {status_counts.get('DROPPED_SPEED_ANOMALY', 0)}")
+        print("=" * 60 + "\n")
 
     if not points:
         print("[-] Warning: No valid GPS telemetry points were extracted.", file=sys.stderr)
         print("Tip: Run with --preview to inspect the OCR region and make sure the telemetry overlay is visible.", file=sys.stderr)
+        if args.debug:
+            print(f"Tip: Inspect {debug_out_file} to see raw OCR text and per-frame failure reasons.", file=sys.stderr)
         sys.exit(1)
 
     # Determine output file paths
-    base_stem = video_path.stem
-    out_dir = video_path.parent
-
     target_formats = ["gpx", "csv", "geojson", "kml"] if args.format == "all" else [args.format]
 
     for fmt in target_formats:

@@ -238,6 +238,41 @@ class TestExporters(unittest.TestCase):
         self.assertNotIn(38.63920, lats)
         self.assertEqual(lats, [35.63910, 35.63920, 35.63940, 35.63950])
 
+    def test_debug_export_and_diagnostics(self):
+        """Verify that debug frame records capture raw OCR and exact drop reasons."""
+        # 1. Clean valid frame
+        pt1, rec1 = TelemetryParser.parse_frame_debug("GARMIN 06/20/2025 10:24:56 AM 35.63910 -106.02303 21 MPH", frame_num=1, time_sec=0.0)
+        # 2. Incomplete frame (missing speed)
+        pt2, rec2 = TelemetryParser.parse_frame_debug("GARMIN 06/20/2025 10:24:57 AM 35.63920 -106.02305", frame_num=2, time_sec=0.033)
+        # 3. Empty OCR frame
+        pt3, rec3 = TelemetryParser.parse_frame_debug("", frame_num=3, time_sec=0.066)
+
+        self.assertIsNotNone(pt1)
+        self.assertEqual(rec1.status, "CANDIDATE")
+        self.assertEqual(rec2.status, "DROPPED_INCOMPLETE")
+        self.assertIn("speed", rec2.drop_reason)
+        self.assertEqual(rec3.status, "NO_TEXT_DETECTED")
+
+        # Clean with debug tracking
+        pts = [pt1, pt2] if pt2 else [pt1]
+        debug_map = {1: rec1, 2: rec2, 3: rec3}
+        cleaned = clean_telemetry_points(pts, debug_map=debug_map)
+
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(rec1.status, "KEPT")
+
+        # Test debug CSV file output
+        debug_csv_path = os.path.join(self.tmp_dir.name, "debug_report.csv")
+        TelemetryExporter.to_debug_csv([rec1, rec2, rec3], debug_csv_path)
+        self.assertTrue(os.path.exists(debug_csv_path))
+
+        with open(debug_csv_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            self.assertIn("KEPT", content)
+            self.assertIn("DROPPED_INCOMPLETE", content)
+            self.assertIn("NO_TEXT_DETECTED", content)
+            self.assertIn("35.639100", content)
+
 
 if __name__ == "__main__":
     unittest.main()
