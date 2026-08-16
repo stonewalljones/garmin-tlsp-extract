@@ -24,6 +24,8 @@ A Python tool to extract burned-in (or embedded) **Timestamps**, **GPS Coordinat
   - Generates a preview image (`preview_roi.png`) and tests OCR on sample frames before processing long videos.
 - **Embedded Telemetry Fast-Path**:
   - Automatically checks if the MP4 container has an embedded subtitle/telemetry track and extracts it directly via FFmpeg.
+- **High-Performance Multi-Threading**:
+  - Distributes image preprocessing and OCR recognition across multiple CPU worker threads in parallel to maximize throughput on multi-core systems.
 - **Strict Completeness & Quality Filter**:
   - Automatically discards incomplete frames (must contain valid GPS coordinates, Date/Time, and Speed).
 - **Neighbor-Based GPS Sanity Check (Outlier & Glitch Rejection)**:
@@ -39,26 +41,28 @@ A Python tool to extract burned-in (or embedded) **Timestamps**, **GPS Coordinat
 ### Prerequisites
 - Python 3.8+
 - [FFmpeg](https://ffmpeg.org/) (installed and on your PATH)
-- *(Optional, for OCR on burned-in videos)*: [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) (`sudo dnf install tesseract` or `sudo apt install tesseract-ocr`)
 
 ### Python Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-*(On Ubuntu/Debian, install Tesseract with: `sudo apt install tesseract-ocr`)*  
-*(On Fedora: `sudo dnf install tesseract`)*  
-*(On macOS: `brew install tesseract ffmpeg`)*
-
 ---
 
 ## 🚀 Usage Guide
 
-### 1. Basic Export (Every Frame -> GPX)
+### 1. Basic Export (Every Frame -> Multi-threaded -> GPX)
 ```bash
 python garmin_extractor.py -i travelapse_video.mp4 -o my_route.gpx
 ```
-*By default, the script analyzes **every single frame** of the video without skipping.*
+*By default, the script analyzes **every single frame** of the video using all available CPU threads.*
+
+### 2. Specify Number of Worker Threads
+```bash
+# Run with 8 parallel worker threads:
+python garmin_extractor.py -i travelapse_video.mp4 --workers 8 --format all
+```
 
 ### 2. Export All Formats (.gpx, .csv, .geojson, .kml)
 ```bash

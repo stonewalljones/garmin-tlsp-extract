@@ -435,11 +435,11 @@ class VideoProcessor:
 
         return candidates
 
-    def run_ocr(self, processed_imgs: Any) -> str:
+    @classmethod
+    def run_ocr(cls, processed_imgs: Any) -> str:
         """
         Runs multi-pass OCR on preprocessed image candidates.
-        Tests PSM 7 (single line) and PSM 6 (uniform block).
-        Returns the first text string that yields valid telemetry or longest output.
+        Thread-safe method called by parallel worker threads.
         """
         if not (HAS_PYTESSERACT or HAS_TESSERACT_BIN or HAS_EASYOCR):
             return ""
@@ -614,6 +614,76 @@ class VideoProcessor:
                     pass
 
         pipe.terminate()
+
+
+def _process_frame_worker(task: Tuple[int, float, Any]) -> Optional[TelemetryPoint]:
+    """Worker function executed in parallel threads to preprocess, OCR, and parse one frame."""
+    frame_num, sec, roi = task
+    if roi is None:
+        return None
+    try:
+        candidates = VideoProcessor.preprocess_for_ocr(roi)
+        ocr_text = VideoProcessor.run_ocr(candidates)
+        if not ocr_text:
+            return None
+        return TelemetryParser.parse_frame_text(ocr_text, frame_num, sec)
+    except Exception:
+        return None
+
+
+def process_frames_parallel(
+    frame_gen: Generator[Tuple[int, float, Any], None, None],
+    num_workers: int = 4,
+    total_frames: Optional[int] = None,
+) -> List[TelemetryPoint]:
+    """
+    Executes frame preprocessing and OCR across multiple worker threads in parallel.
+    Uses a rolling buffer to minimize memory usage while keeping CPU workers fully saturated.
+    """
+    points: List[TelemetryPoint] = []
+    max_queued = max(8, num_workers * 4)
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_map: Dict[Any, int] = {}
+        pbar = (
+            tqdm(total=total_frames, desc=f"Processing Frames ({num_workers} threads)", unit="frame")
+            if HAS_TQDM
+            else None
+        )
+
+        for frame_item in frame_gen:
+            fut = executor.submit(_process_frame_worker, frame_item)
+            future_map[fut] = frame_item[0]
+
+            # Drain completed tasks when the queue gets full
+            while len(future_map) >= max_queued:
+                done, _ = concurrent.futures.wait(
+                    future_map.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for f in done:
+                    pt = f.result()
+                    if pt:
+                        points.append(pt)
+                    if pbar is not None:
+                        pbar.update(1)
+                    del future_map[f]
+
+        # Drain all remaining tasks
+        for f in concurrent.futures.as_completed(future_map.keys()):
+            pt = f.result()
+            if pt:
+                points.append(pt)
+            if pbar is not None:
+                pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
+
+    # Ensure chronological sort by frame number
+    points.sort(key=lambda p: p.frame_number)
+    return points
 
 
 # ==============================================================================
@@ -1114,6 +1184,13 @@ Examples:
         help="Process every single video frame without skipping (default: True).",
     )
     parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=min(32, max(2, (os.cpu_count() or 4))),
+        help=f"Number of parallel worker threads for OCR processing (default: {min(32, max(2, (os.cpu_count() or 4)))}).",
+    )
+    parser.add_argument(
         "--roi",
         nargs=4,
         type=float,
@@ -1176,12 +1253,28 @@ Examples:
                 print(f"[+] Found {len(embedded)} telemetry points in embedded track!")
                 points = embedded
 
-        # Run OCR if no embedded track found
+        # Run multi-threaded OCR if no embedded track found
         if not points:
             check_ocr_availability()
             mode_desc = "every frame" if (args.every_frame or args.interval <= 0) else f"{args.interval}s interval"
-            print(f"[*] Starting video OCR extraction ({mode_desc})...")
+            print(f"[*] Starting multi-threaded OCR extraction ({mode_desc}, {args.workers} threads)...")
             processor = VideoProcessor(str(video_path), roi_bbox=roi_bbox)
+
+            total_frames = None
+            if HAS_OPENCV:
+                try:
+                    cap = cv2.VideoCapture(str(video_path))
+                    if cap.isOpened():
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        if args.every_frame or args.interval <= 0:
+                            total_frames = total_video_frames
+                        else:
+                            step = max(1, int(round(fps * args.interval)))
+                            total_frames = total_video_frames // step
+                        cap.release()
+                except Exception:
+                    pass
 
             frame_gen = (
                 processor.extract_frames_opencv(sample_interval_sec=args.interval, every_frame=args.every_frame)
@@ -1189,14 +1282,7 @@ Examples:
                 else processor.extract_frames_ffmpeg(sample_interval_sec=args.interval, every_frame=args.every_frame)
             )
 
-            iterator = tqdm(frame_gen, desc="Processing Frames", unit="frame") if HAS_TQDM else frame_gen
-
-            for frame_num, sec, roi in iterator:
-                candidates = processor.preprocess_for_ocr(roi)
-                ocr_text = processor.run_ocr(candidates)
-                p = TelemetryParser.parse_frame_text(ocr_text, frame_num, sec)
-                if p:
-                    points.append(p)
+            points = process_frames_parallel(frame_gen, num_workers=args.workers, total_frames=total_frames)
 
     print(f"[*] Raw extracted points: {len(points)}")
     points = clean_telemetry_points(points)
