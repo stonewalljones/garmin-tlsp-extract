@@ -1,0 +1,10 @@
+# Core dependencies
+# Note: The extractor also supports pure fallback mode using ffmpeg and standard libraries!
+opencv-python>=4.8.0
+pytesseract>=0.3.10
+Pillow>=9.5.0
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Optional advanced OCR engine
+# easyocr>=1.7.0
