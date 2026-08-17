@@ -137,9 +137,18 @@ class TelemetryParser:
 
     # Pre-compiled regular expressions for OCR variations
 
-    # Garmin speed patterns: e.g. "45 MPH", "72 KM/H", "0 mph", "105.4 km/h"
+    # Garmin speed pattern — handles OCR corruptions observed in real video:
+    #   - Dash/dot/underscore glued between number and unit: "22-MPH", "15.MPH", "84_MPH"
+    #   - Letter O confused with zero: "OMPH", "O-MPH"
+    #   - Unit fragmented by spaces/dots: "MP H", "M.P.H", "M-P-H"
+    #   - No separator at all: "22MPH"
     SPEED_PATTERN = re.compile(
-        r"(?i)\b(?P<speed>\d{1,3}(?:\.\d+)?)\s*(?P<unit>mph|km/h|kmh|kph|km\/h|knots|kt)\b"
+        r"(?i)"
+        r"(?<![\d\.])"
+        r"(?P<speed>[Oo]|\d{1,3}(?:\.\d+)?)"
+        r"[\-\—\–\_\.\s]{0,3}"
+        r"(?P<unit>M[\-\.\s]?P[\-\.\s]?H|MPH|KM[\./ ]H|KMH|KPH|KNOTS?|KT)"
+        r"(?!\d)",
     )
 
     # Date/Time patterns commonly used by Garmin:
@@ -189,9 +198,9 @@ class TelemetryParser:
             "|": " ",
             "~": "-",
             "—": "-",
-            "°": " ",
+            "–": "-",
             "*": " ",
-            "’": "'",
+            "'": "'",
             "`": "'",
             "[": " ",
             "]": " ",
@@ -201,6 +210,18 @@ class TelemetryParser:
         cleaned = text
         for k, v in replacements.items():
             cleaned = cleaned.replace(k, v)
+
+        # ── Longitude decimal-point normalisation ─────────────────────────────
+        # OCR frequently misreads the decimal point in the 3-digit western longitude
+        # as a colon, degree sign, or dash, e.g.:
+        #   "-106:02727"  →  "-106.02727"   (colon misread)
+        #   "-106°02848"  →  "-106.02848"   (degree sign misread)
+        #   "-106-02774"  →  "-106.02774"   (dash misread — must be 4-6 decimal digits)
+        # These patterns are safe: timestamps use 2-digit fields (HH:MM) so the
+        # 3-digit-before-separator constraint avoids false matches in time strings.
+        cleaned = re.sub(r'(-1\d{2})[:°](\d{4,6})\b', r'\1.\2', cleaned)
+        cleaned = re.sub(r'(-1\d{2})-(\d{4,6})\b', r'\1.\2', cleaned)
+
         # Collapse repeated spaces
         return re.sub(r"[ \t]+", " ", cleaned).strip()
 
@@ -279,16 +300,22 @@ class TelemetryParser:
             return (None, None, None)
 
         try:
-            val = float(m.group("speed"))
-            unit = m.group("unit").lower().replace("/", "")
+            # Normalise speed value: strip embedded junk, handle letter-O → 0
+            raw_speed = m.group("speed").strip()
+            raw_speed = raw_speed.replace("O", "0").replace("o", "0")
+            val = float(raw_speed)
 
-            if unit in ("mph",):
+            # Normalise unit: collapse fragmented variants ("M.P.H", "M-P-H", "MP H" → "mph")
+            raw_unit = m.group("unit").lower()
+            raw_unit = re.sub(r'[\-\.\s]', '', raw_unit)  # strip separators inside unit
+
+            if raw_unit == "mph":
                 mph = val
                 kmh = mph * 1.609344
-            elif unit in ("kmh", "kph"):
+            elif raw_unit in ("kmh", "kph", "kmh"):
                 kmh = val
                 mph = kmh / 1.609344
-            elif unit in ("knots", "kt"):
+            elif raw_unit in ("knots", "kt"):
                 mph = val * 1.15078
                 kmh = val * 1.852
             else:
@@ -463,124 +490,159 @@ class VideoProcessor:
         x2 = min(w, int(xmax * w))
         return image_np[y1:y2, x1:x2]
 
+    # Minimum ratio of bright pixels in ROI required to attempt OCR.
+    # ROIs below this threshold are blank/dark frames with no telemetry overlay.
+    _BRIGHT_PIXEL_THRESHOLD: int = 170
+    _BRIGHT_PIXEL_MIN_RATIO: float = 0.02
+
     @staticmethod
-    def preprocess_for_ocr(roi_image: Any) -> List[Any]:
+    def _has_overlay_pixels(gray: Any) -> bool:
         """
-        Prepares video frame banner for OCR:
-        1. Isolates bright/white overlay text from dark dashboard.
-        2. Inverts to crisp black text on pure white background (Tesseract standard).
-        3. Adds border padding so Tesseract character bounding boxes don't touch image edges.
-        Returns a list of candidate preprocessed images for multi-pass OCR.
+        Fast pixel density pre-filter (~0.1ms). Returns False when the ROI is a
+        blank/dark frame that cannot contain the Garmin telemetry overlay, allowing
+        the worker to skip all Tesseract calls entirely.
         """
-        if not HAS_OPENCV or roi_image is None or roi_image.size == 0:
-            return [roi_image]
+        if not HAS_OPENCV or gray is None:
+            return True  # Can't check — let OCR try anyway
+        bright_count = int(np.count_nonzero(gray >= VideoProcessor._BRIGHT_PIXEL_THRESHOLD))
+        total = gray.size
+        return total > 0 and (bright_count / total) >= VideoProcessor._BRIGHT_PIXEL_MIN_RATIO
 
-        candidates = []
-
-        # Convert to grayscale
+    @staticmethod
+    def _make_scaled_gray(roi_image: Any) -> Any:
+        """Converts ROI to grayscale and upscales to at least 60px tall for Tesseract."""
         if len(roi_image.shape) == 3:
             gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
         else:
             gray = roi_image.copy()
-
-        # Upscale 2.5x to 3x for clear character definition
         h, w = gray.shape[:2]
         if h < 60:
             scale_factor = max(2.0, 70.0 / max(1, h))
-            scaled_gray = cv2.resize(
-                gray, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC
-            )
-        else:
-            scaled_gray = gray
+            gray = cv2.resize(gray, (0, 0), fx=scale_factor, fy=scale_factor,
+                              interpolation=cv2.INTER_CUBIC)
+        return gray
 
-        # --- Candidate 1: White-Text Brightness Isolation + Inverted (Black on White) ---
-        # Garmin text is bright (>160-190 intensity). Isolate bright text:
-        _, bright_thresh = cv2.threshold(scaled_gray, 170, 255, cv2.THRESH_BINARY)
-        # Invert: black text on white background (Tesseract performs vastly better)
-        inverted_bright = cv2.bitwise_not(bright_thresh)
-        # Add 15px white border padding around image
-        padded_bright = cv2.copyMakeBorder(
-            inverted_bright, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255
-        )
-        candidates.append(padded_bright)
+    @staticmethod
+    def _candidate_images(scaled_gray: Any):
+        """
+        Lazy generator that yields preprocessed candidate images one at a time.
+        Candidates are ordered fastest-to-slowest so the caller can stop as soon
+        as a successful parse is found, avoiding unnecessary preprocessing work.
 
-        # --- Candidate 2: Bilateral Filter + Otsu Inverted ---
-        denoised = cv2.bilateralFilter(scaled_gray, 7, 50, 50)
-        _, otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        inverted_otsu = cv2.bitwise_not(otsu)
-        padded_otsu = cv2.copyMakeBorder(
-            inverted_otsu, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255
-        )
-        candidates.append(padded_otsu)
+        Candidate 1 - brightness threshold (fastest, best for Garmin white-on-dark)
+        Candidate 2 - morphological close + Otsu  (catches lower-contrast text)
+        Candidate 3 - contrast-stretched grayscale (final fallback)
+        """
+        pad = lambda img: cv2.copyMakeBorder(img, 15, 15, 15, 15,
+                                              cv2.BORDER_CONSTANT, value=255)
+        # Candidate 1: direct brightness threshold + invert
+        _, bright = cv2.threshold(scaled_gray, 170, 255, cv2.THRESH_BINARY)
+        yield pad(cv2.bitwise_not(bright))
 
-        # --- Candidate 3: Scaled Grayscale with Contrast Stretch ---
-        norm_gray = cv2.normalize(scaled_gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-        padded_gray = cv2.copyMakeBorder(
-            norm_gray, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255
-        )
-        candidates.append(padded_gray)
+        # Candidate 2: morphological close (replaces the slow bilateralFilter) + Otsu + invert
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed = cv2.morphologyEx(scaled_gray, cv2.MORPH_CLOSE, kernel)
+        _, otsu = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        yield pad(cv2.bitwise_not(otsu))
 
-        return candidates
+        # Candidate 3: contrast-stretched grayscale
+        norm = cv2.normalize(scaled_gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+        yield pad(norm)
 
     @classmethod
-    def run_ocr(cls, processed_imgs: Any) -> str:
+    def run_ocr_on_roi(cls, roi_image: Any) -> str:
         """
-        Runs multi-pass OCR on preprocessed image candidates.
-        Thread-safe method called by parallel worker threads.
+        Unified, lazy OCR pipeline:
+        1. Fast pixel density pre-filter - skips Tesseract on blank/dark frames entirely.
+        2. Generates candidate preprocessed images one at a time (no eager allocation).
+        3. Tries PSM 7 then PSM 6 on each candidate, stopping as soon as GPS
+           coordinates parse successfully (no PSM 11 - too slow for single-line overlays).
+        4. Uses --oem 1 (LSTM only) instead of --oem 3 for consistent, faster calls.
+
+        Thread-safe - called directly by parallel worker threads.
         """
         if not (HAS_PYTESSERACT or HAS_TESSERACT_BIN or HAS_EASYOCR):
             return ""
 
-        if not isinstance(processed_imgs, list):
-            processed_imgs = [processed_imgs]
+        if not HAS_OPENCV or roi_image is None or roi_image.size == 0:
+            # No OpenCV - fall back to raw PIL OCR
+            return cls._tesseract_call(roi_image, "--psm 6")
 
+        scaled_gray = cls._make_scaled_gray(roi_image)
+
+        # ── Pre-filter: skip Tesseract entirely on blank/dark frames ──────────
+        if not cls._has_overlay_pixels(scaled_gray):
+            return ""
+
+        # ── Lazy per-candidate loop, PSM 7 then PSM 6, stop on first parse ───
+        psm_modes = ("--psm 7", "--psm 6")
         best_text = ""
-        psm_modes = ["--psm 7", "--psm 6", "--psm 11"]
 
-        for img in processed_imgs:
+        for candidate_img in cls._candidate_images(scaled_gray):
             for psm in psm_modes:
-                text = ""
-                if HAS_PYTESSERACT:
-                    try:
-                        pil_img = Image.fromarray(img) if (HAS_OPENCV and isinstance(img, np.ndarray)) else img
-                        text = pytesseract.image_to_string(pil_img, config=f"{psm} --oem 3")
-                    except Exception:
-                        pass
-                elif HAS_TESSERACT_BIN:
-                    import tempfile
-
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                        tmp_name = tmp.name
-
-                    try:
-                        if HAS_OPENCV and isinstance(img, np.ndarray):
-                            cv2.imwrite(tmp_name, img)
-                        elif hasattr(img, "save"):
-                            img.save(tmp_name)
-
-                        res = subprocess.run(
-                            ["tesseract", tmp_name, "stdout", psm, "--oem", "3"],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL,
-                            stdin=subprocess.DEVNULL,
-                            text=True,
-                            timeout=5,
-                        )
-                        text = res.stdout
-                    except Exception:
-                        pass
-                    finally:
-                        if os.path.exists(tmp_name):
-                            os.remove(tmp_name)
-
-                # Check if this pass successfully parsed coordinates
+                text = cls._tesseract_call(candidate_img, psm)
                 if text and TelemetryParser.parse_coordinates(text):
-                    return text
-
+                    return text  # ← early exit on first successful parse
                 if len(text.strip()) > len(best_text.strip()):
                     best_text = text
 
         return best_text
+
+    @staticmethod
+    def _tesseract_call(img: Any, psm: str) -> str:
+        """
+        Single Tesseract invocation. Uses --oem 1 (LSTM only) for consistent
+        timing. Returns empty string on any error.
+        """
+        config = f"{psm} --oem 1"
+        if HAS_PYTESSERACT:
+            try:
+                pil_img = (
+                    Image.fromarray(img)
+                    if (HAS_OPENCV and isinstance(img, np.ndarray))
+                    else img
+                )
+                return pytesseract.image_to_string(pil_img, config=config)
+            except Exception:
+                return ""
+        elif HAS_TESSERACT_BIN:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_name = tmp.name
+            try:
+                if HAS_OPENCV and isinstance(img, np.ndarray):
+                    cv2.imwrite(tmp_name, img)
+                elif hasattr(img, "save"):
+                    img.save(tmp_name)
+                res = subprocess.run(
+                    ["tesseract", tmp_name, "stdout"] + psm.split() + ["--oem", "1"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    timeout=5,
+                )
+                return res.stdout
+            except Exception:
+                return ""
+            finally:
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+        return ""
+
+    # ── Legacy shims so existing callers (preview, tests) still work ─────────
+    @staticmethod
+    def preprocess_for_ocr(roi_image: Any) -> List[Any]:
+        """Compatibility shim - returns the raw ROI; run_ocr_on_roi handles preprocessing lazily."""
+        return [roi_image]
+
+    @classmethod
+    def run_ocr(cls, processed_imgs: Any) -> str:
+        """Compatibility shim for callers that still use the old two-step API."""
+        roi = processed_imgs[0] if isinstance(processed_imgs, list) else processed_imgs
+        return cls.run_ocr_on_roi(roi)
 
     def extract_frames_opencv(
         self, sample_interval_sec: float = 0.0, every_frame: bool = False
@@ -704,7 +766,7 @@ class VideoProcessor:
 
 
 def _process_frame_worker(task: Tuple[int, float, Any]) -> Tuple[Optional[TelemetryPoint], DebugFrameRecord]:
-    """Worker function executed in parallel threads to preprocess, OCR, and parse one frame."""
+    """Worker function executed in parallel threads to OCR and parse one frame."""
     frame_num, sec, roi = task
     if roi is None:
         rec = DebugFrameRecord(
@@ -716,8 +778,8 @@ def _process_frame_worker(task: Tuple[int, float, Any]) -> Tuple[Optional[Teleme
         )
         return (None, rec)
     try:
-        candidates = VideoProcessor.preprocess_for_ocr(roi)
-        ocr_text = VideoProcessor.run_ocr(candidates)
+        # Unified lazy pipeline: pre-filter + lazy candidate generation + PSM 7/6 + oem 1
+        ocr_text = VideoProcessor.run_ocr_on_roi(roi)
         return TelemetryParser.parse_frame_debug(ocr_text, frame_num, sec)
     except Exception as e:
         rec = DebugFrameRecord(
